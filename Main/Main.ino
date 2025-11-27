@@ -1,10 +1,15 @@
 #include <Wire.h>
 #include <MPU6050.h>
 #include <Adafruit_BMP280.h>
-#include "Kalman.h"  
+#include "Kalman.h" 
+
+//HardwareSerial Telemetry(2); // UART2
 
 MPU6050 mpu;
 Adafruit_BMP280 bmp;
+
+#define RX2_PIN 16
+#define TX2_PIN 17
 
 // Variabel sensor
 int16_t accX, accY, accZ;
@@ -78,7 +83,9 @@ void setup() {
 
   lastTime = micros();
 
-  Serial.println("Sensor siap...");
+  //Telemetry.begin(57600, SERIAL_8N1, 16, 17); // RX=16 , TX=17
+
+  //Serial.println("Sensor siap...");
 }
 
 void loop() {
@@ -122,6 +129,14 @@ void loop() {
 }
 
 altitude = altitudeRaw - altitudeOffset;
+
+  // KIRIM DATA TELEMETRY
+  //Telemetry.print("RollKalman:"); Telemetry.print(rollKalman);
+  //Telemetry.print(",PitchKalman:"); Telemetry.print(pitchKalman);
+  //Telemetry.print(",RollComp:"); Telemetry.print(rollComp);
+  //Telemetry.print(",PitchComp:"); Telemetry.print(pitchComp);
+  //Telemetry.print(",Altitude:"); Telemetry.print(altitude);
+  //Telemetry.print(",Pressure:"); Telemetry.println(pressure);
 
 
   // KIRIM DATA SERIAL
