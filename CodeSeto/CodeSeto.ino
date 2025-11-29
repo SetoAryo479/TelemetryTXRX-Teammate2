@@ -43,6 +43,9 @@ bool firstAltitudeRead = true;
 Kalman kalmanRoll;
 Kalman kalmanPitch;
 
+float targetRoll = 0;
+float targetPitch = 0;
+
 unsigned long lastTime;
 float dt;
 
@@ -89,7 +92,26 @@ void setup() {
 }
 
 void loop() {
+  if (Serial.available()) {
+    char cmd = Serial.read();
+
+    if (cmd == 'w') targetPitch += 5;
+    if (cmd == 's') targetPitch -= 5;
+    if (cmd == 'a') targetRoll  += 5;
+    if (cmd == 'd') targetRoll  -= 5;
+
+    // batas aman (opsional)
+    if (targetRoll > 90) targetRoll = 90;
+    if (targetRoll < -90) targetRoll = -90;
+    if (targetPitch > 90) targetPitch = 90;
+    if (targetPitch < -90) targetPitch = -90;
+
+    //Serial.print(" | TargetPitch = ");
+    //Serial.println(targetPitch);
+  }
   // hitung dt
+
+
   unsigned long now = micros();
   dt = (now - lastTime) / 1000000.0;
   lastTime = now;
@@ -142,10 +164,21 @@ altitude = altitudeRaw - altitudeOffset;
   // KIRIM DATA SERIAL
   Serial.print("RollKalman:"); Serial.print(rollKalman);
   Serial.print(",PitchKalman:"); Serial.print(pitchKalman);
-  Serial.print(",RollComp:"); Serial.print(rollComp);
-  Serial.print(",PitchComp:"); Serial.print(pitchComp);
+  //Serial.print(",RollComp:"); Serial.print(rollComp);
+  //Serial.print(",PitchComp:"); Serial.print(pitchComp);
   Serial.print(",Altitude:"); Serial.print(altitude);
-  Serial.print(",Pressure:"); Serial.println(pressure);
+  //Serial.print(",Pressure:"); Serial.println(pressure);
+  Serial.print(" ThredHoldRoll :"); Serial.println(targetRoll);
+
+  // SIMPAN DATA 
+  
+
+  // ---------------- ALERT SYSTEM ----------------
+  float rollThreshold = targetRoll; // batas derajat roll
+
+  if (abs(rollKalman) >= rollThreshold) {
+  Serial.println("⚠ ROLL MELEBIHI BATAS!");
+  }
 
   delay(20); // 50Hz
 }
