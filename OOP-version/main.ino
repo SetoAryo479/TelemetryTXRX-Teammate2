@@ -1,224 +1,279 @@
 #include <Wire.h>
-#include <MPU6050.h>
-#include <Adafruit_BMP280.h>
-#include "Kalman.h"
 
-// ================== KELAS IMU + BARO ==================
-class IMUBaro {
+// ========================================
+//  MPU6050 REGISTER
+// ========================================
+#define MPU_ADDR        0x68
+#define MPU_PWR_MGMT_1  0x6B
+#define MPU_ACCEL_XOUT_H 0x3B
+
+// ========================================
+//  BMP280 REGISTER
+// ========================================
+#define BMP_ADDR           0x76
+#define BMP280_REG_CONTROL 0xF4
+#define BMP280_REG_CONFIG  0xF5
+#define BMP280_REG_PRESS_MSB 0xF7
+#define BMP280_DIG_T1      0x88
+
+// ----------------------------------------
+// Struktur Kalibrasi BMP280
+// ----------------------------------------
+uint16_t dig_T1; int16_t dig_T2, dig_T3;
+uint16_t dig_P1; int16_t dig_P2, dig_P3, dig_P4, dig_P5, dig_P6, dig_P7, dig_P8, dig_P9;
+
+// ========================================
+//  KELAS KALMAN TANPA LIBRARY
+// ========================================
+class SimpleKalman {
 public:
-  IMUBaro() :
-    gx_off(0), gy_off(0), gz_off(0),
-    altitudeOffset(0), firstAltitudeRead(true),
-    lastTime(0),
-    rollAcc(0), pitchAcc(0),
-    rollKalman(0), pitchKalman(0),
-    rollComp(0), pitchComp(0),
-    pressure(0), altitude(0),
-    accY_lp(0), accZ_lp(0) {}
+    float Q_angle = 0.001f;
+    float Q_bias  = 0.003f;
+    float R_measure = 0.03f;
 
-  bool begin() {
-    Wire.begin();
+    float angle = 0;
+    float bias  = 0;
 
-    // Inisialisasi MPU6050
-    mpu.initialize();
-    if (!mpu.testConnection()) {
-      Serial.println("MPU6050 tidak terdeteksi!");
-      return false;
+    float P[2][2] = {{0,0},{0,0}};
+
+    void setAngle(float newAngle) { angle = newAngle; }
+
+    float getAngle(float newAngle, float newRate, float dt) {
+        newRate -= bias;
+        angle += dt * newRate;
+
+        P[0][0] += dt * (dt*P[1][1] - P[0][1] - P[1][0] + Q_angle);
+        P[0][1] -= dt * P[1][1];
+        P[1][0] -= dt * P[1][1];
+        P[1][1] += Q_bias * dt;
+
+        float S = P[0][0] + R_measure;
+        float K[2];
+        K[0] = P[0][0] / S;
+        K[1] = P[1][0] / S;
+
+        float y = newAngle - angle;
+
+        angle += K[0] * y;
+        bias  += K[1] * y;
+
+        float P00_temp = P[0][0];
+        float P01_temp = P[0][1];
+
+        P[0][0] -= K[0] * P00_temp;
+        P[0][1] -= K[0] * P01_temp;
+        P[1][0] -= K[1] * P00_temp;
+        P[1][1] -= K[1] * P01_temp;
+
+        return angle;
     }
-
-    // Inisialisasi BMP280
-    if (!bmp.begin(0x76)) {
-      Serial.println("BMP280 tidak terdeteksi!");
-      return false;
-    }
-
-    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                    Adafruit_BMP280::SAMPLING_X2,
-                    Adafruit_BMP280::SAMPLING_X16,
-                    Adafruit_BMP280::FILTER_X16,
-                    Adafruit_BMP280::STANDBY_MS_63);
-
-    calibrateGyro();
-    initKalman();
-    lastTime = micros();
-
-    return true;
-  }
-
-  // Dipanggil di loop() untuk update semua perhitungan
-  void update() {
-    // Hitung dt
-    unsigned long now = micros();
-    float dt = (now - lastTime) / 1000000.0;
-    lastTime = now;
-
-    // Baca raw data IMU
-    mpu.getMotion6(&accX, &accY, &accZ, &gyroX, &gyroY, &gyroZ);
-
-    // Low-pass filter (kalau mau pakai nantinya)
-    accY_lp = 0.96f * accY_lp + 0.04f * accY;
-    accZ_lp = 0.96f * accZ_lp + 0.04f * accZ;
-
-    // Sudut dari accelerometer
-    rollAcc  = atan2(accY, accZ) * 180.0 / PI;
-    pitchAcc = atan2(-accX, sqrt(accY * accY + accZ * accZ)) * 180.0 / PI;
-
-    // Konversi gyro ke derajat/detik
-    float gyroXrate = (gyroX - gx_off) / 131.0;
-    float gyroYrate = (gyroY - gy_off) / 131.0;
-
-    // Kalman filter
-    rollKalman  = kalmanRoll.getAngle(rollAcc,  gyroXrate, dt);
-    pitchKalman = kalmanPitch.getAngle(pitchAcc, gyroYrate, dt);
-
-    // Complementary filter (jika mau dipakai)
-    rollComp  = 0.995f * (rollComp  + gyroXrate * dt) + 0.005f * rollAcc;
-    pitchComp = 0.995f * (pitchComp + gyroYrate * dt) + 0.005f * pitchAcc;
-
-    // BMP280
-    pressure = bmp.readPressure() / 100.0;   // hPa
-
-    float altitudeRaw = bmp.readAltitude(1013.25);
-    if (firstAltitudeRead) {
-      altitudeOffset = altitudeRaw;
-      firstAltitudeRead = false;
-    }
-    altitude = altitudeRaw - altitudeOffset;
-  }
-
-  // Getter sudut & ketinggian
-  float getRollKalman()  const { return rollKalman; }
-  float getPitchKalman() const { return pitchKalman; }
-  float getRollComp()    const { return rollComp; }
-  float getPitchComp()   const { return pitchComp; }
-  float getAltitude()    const { return altitude; }
-  float getPressure()    const { return pressure; }
-
-private:
-  MPU6050 mpu;
-  Adafruit_BMP280 bmp;
-  Kalman kalmanRoll;
-  Kalman kalmanPitch;
-
-  // Raw data sensor
-  int16_t accX, accY, accZ;
-  int16_t gyroX, gyroY, gyroZ;
-
-  // Offset gyro
-  float gx_off, gy_off, gz_off;
-
-  // Variabel sudut
-  float rollAcc, pitchAcc;
-  float rollKalman, pitchKalman;
-  float rollComp, pitchComp;
-
-  // Variabel barometer
-  float pressure;
-  float altitude;
-  float altitudeOffset;
-  bool  firstAltitudeRead;
-
-  // Low-pass filter akselerometer (opsional)
-  float accY_lp, accZ_lp;
-
-  // Timing
-  unsigned long lastTime;
-
-  void calibrateGyro() {
-    long sumX = 0, sumY = 0, sumZ = 0;
-    const int N = 500;
-    Serial.println("Kalibrasi gyro, harap diamkan modul...");
-    for (int i = 0; i < N; i++) {
-      mpu.getMotion6(&accX, &accY, &accZ, &gyroX, &gyroY, &gyroZ);
-      sumX += gyroX;
-      sumY += gyroY;
-      sumZ += gyroZ;
-      delay(3);
-    }
-    gx_off = sumX / (float)N;
-    gy_off = sumY / (float)N;
-    gz_off = sumZ / (float)N;
-
-    Serial.println("Kalibrasi gyro selesai.");
-  }
-
-  void initKalman() {
-    // Baca awal untuk inisialisasi Kalman
-    mpu.getMotion6(&accX, &accY, &accZ, &gyroX, &gyroY, &gyroZ);
-    rollAcc  = atan2(accY, accZ) * 180.0 / PI;
-    pitchAcc = atan2(-accX, sqrt(accY * accY + accZ * accZ)) * 180.0 / PI;
-
-    kalmanRoll.setAngle(rollAcc);
-    kalmanPitch.setAngle(pitchAcc);
-
-    rollComp  = rollAcc;
-    pitchComp = pitchAcc;
-  }
 };
 
-// ================== OBJEK GLOBAL ==================
-IMUBaro imuBaro;
+// ========================================
+//  KELAS IMU + BARO TANPA LIBRARY
+// ========================================
+class IMUBaro {
+public:
+    // IMU raw
+    int16_t accX, accY, accZ;
+    int16_t gyroX, gyroY, gyroZ;
 
-// Target sudut
-float targetRoll  = 0.0;
-float targetPitch = 0.0;
+    float gx_off, gy_off, gz_off;
 
-// ================== SETUP ==================
+    // Angle
+    float rollAcc, pitchAcc;
+    float rollKal, pitchKal;
+
+    // Kalman
+    SimpleKalman Kroll, Kpitch;
+
+    // BMP280 data
+    float pressure, altitude;
+    float altitudeOffset;
+    bool firstAltitude = true;
+
+    unsigned long lastTime = 0;
+
+    bool begin() {
+        Wire.begin();
+        initMPU6050();
+        initBMP280();
+        calibrateGyro();
+        initKalman();
+        lastTime = micros();
+        return true;
+    }
+
+    // Main update
+    void update() {
+        float dt = (micros() - lastTime) / 1e6;
+        lastTime = micros();
+
+        readMPU6050();
+        calculateAngles(dt);
+        readBMP280();
+    }
+
+    // Getter
+    float getRollKalman()  { return rollKal; }
+    float getPitchKalman() { return pitchKal; }
+    float getAltitude()    { return altitude; }
+
+private:
+
+    // ---------------- MPU6050 ----------------
+    void initMPU6050() {
+        write8(MPU_ADDR, MPU_PWR_MGMT_1, 0x00);
+    }
+
+    void readMPU6050() {
+        Wire.beginTransmission(MPU_ADDR);
+        Wire.write(MPU_ACCEL_XOUT_H);
+        Wire.endTransmission(false);
+        Wire.requestFrom(MPU_ADDR, 14, true);
+
+        accX = Wire.read()<<8 | Wire.read();
+        accY = Wire.read()<<8 | Wire.read();
+        accZ = Wire.read()<<8 | Wire.read();
+        gyroX = Wire.read()<<8 | Wire.read();
+        gyroY = Wire.read()<<8 | Wire.read();
+        gyroZ = Wire.read()<<8 | Wire.read();
+    }
+
+    void calibrateGyro() {
+        long sx=0, sy=0, sz=0;
+        for(int i=0;i<500;i++){
+            readMPU6050();
+            sx+=gyroX; sy+=gyroY; sz+=gyroZ;
+            delay(3);
+        }
+        gx_off = sx/500.0;
+        gy_off = sy/500.0;
+        gz_off = sz/500.0;
+    }
+
+    void initKalman() {
+        readMPU6050();
+        rollAcc  = atan2(accY, accZ)*180/PI;
+        pitchAcc = atan2(-accX, sqrt(accY*accY+accZ*accZ))*180/PI;
+
+        Kroll.setAngle(rollAcc);
+        Kpitch.setAngle(pitchAcc);
+    }
+
+    void calculateAngles(float dt) {
+        rollAcc  = atan2(accY, accZ)*180/PI;
+        pitchAcc = atan2(-accX, sqrt(accY*accY+accZ*accZ))*180/PI;
+
+        float gx = (gyroX - gx_off)/131.0;
+        float gy = (gyroY - gy_off)/131.0;
+
+        rollKal  = Kroll.getAngle(rollAcc,  gx, dt);
+        pitchKal = Kpitch.getAngle(pitchAcc, gy, dt);
+    }
+
+    // ---------------- BMP280 ----------------
+    void initBMP280() {
+        readBMP280Calibration();
+        write8(BMP_ADDR, BMP280_REG_CONTROL, 0x27);
+        write8(BMP_ADDR, BMP280_REG_CONFIG, 0xA0);
+    }
+
+    void readBMP280() {
+        int32_t adc_P = read24(BMP280_REG_PRESS_MSB);
+
+        // Compensation dari datasheet
+        int32_t var1, var2;
+        var1 = (((adc_P>>3) - ((int32_t)dig_P1<<1)) * dig_P2) >> 11;
+        var2 = (((((adc_P>>4) - (int32_t)dig_P1) * ((adc_P>>4) - (int32_t)dig_P1)) >> 12) *
+                dig_P3) >> 14;
+
+        int32_t p = (var1 + var2);
+        if (p == 0) return;
+        p = ((((adc_P) - ((p >> 8))) * 3125));
+
+        pressure = p / 100.0;
+
+        float altitudeRaw = 44330.0 * (1.0 - pow(pressure / 1013.25, 0.1903));
+
+        if (firstAltitude) {
+            altitudeOffset = altitudeRaw;
+            firstAltitude = false;
+        }
+
+        altitude = altitudeRaw - altitudeOffset;
+    }
+
+    void readBMP280Calibration() {
+        dig_T1 = read16(BMP280_DIG_T1);
+        dig_T2 = readS16(BMP280_DIG_T1+2);
+        dig_T3 = readS16(BMP280_DIG_T1+4);
+
+        dig_P1 = read16(BMP280_DIG_T1+6);
+        dig_P2 = readS16(BMP280_DIG_T1+8);
+        dig_P3 = readS16(BMP280_DIG_T1+10);
+        dig_P4 = readS16(BMP280_DIG_T1+12);
+        dig_P5 = readS16(BMP280_DIG_T1+14);
+        dig_P6 = readS16(BMP280_DIG_T1+16);
+        dig_P7 = readS16(BMP280_DIG_T1+18);
+        dig_P8 = readS16(BMP280_DIG_T1+20);
+        dig_P9 = readS16(BMP280_DIG_T1+22);
+    }
+
+    // -------------- I2C Helpers ----------------
+    uint16_t read16(uint8_t reg) {
+        Wire.beginTransmission(BMP_ADDR);
+        Wire.write(reg);
+        Wire.endTransmission();
+        Wire.requestFrom(BMP_ADDR, 2);
+        return (Wire.read()<<8 | Wire.read());
+    }
+
+    int16_t readS16(uint8_t reg) {
+        return (int16_t)read16(reg);
+    }
+
+    uint32_t read24(uint8_t reg) {
+        Wire.beginTransmission(BMP_ADDR);
+        Wire.write(reg);
+        Wire.endTransmission();
+        Wire.requestFrom(BMP_ADDR, 3);
+        return (Wire.read()<<16 | Wire.read()<<8 | Wire.read());
+    }
+
+    void write8(uint8_t addr, uint8_t reg, uint8_t value) {
+        Wire.beginTransmission(addr);
+        Wire.write(reg);
+        Wire.write(value);
+        Wire.endTransmission();
+    }
+};
+
+// ========================================
+// GLOBAL OBJECT
+// ========================================
+IMUBaro imu;
+
+// ========================================
+// ARDUINO SYSTEM
+// ========================================
 void setup() {
-  Serial.begin(115200);
-  while (!Serial) {;}
-
-  Serial.println("Mulai inisialisasi sensor...");
-
-  if (!imuBaro.begin()) {
-    Serial.println("Inisialisasi sensor gagal. Cek koneksi hardware.");
-    while (1);
-  }
-
-  Serial.println("Sensor siap...");
+    Serial.begin(115200);
+    imu.begin();
 }
 
-// ================== FUNGSI INPUT ==================
-void handleKeyboardInput() {
-  if (Serial.available()) {
-    char cmd = Serial.read();
-
-    if (cmd == 'w') targetPitch += 5;
-    if (cmd == 's') targetPitch -= 5;
-    if (cmd == 'a') targetRoll  += 5;
-    if (cmd == 'd') targetRoll  -= 5;
-
-    // Batas aman
-    if (targetRoll > 90) targetRoll = 90;
-    if (targetRoll < -90) targetRoll = -90;
-    if (targetPitch > 90) targetPitch = 90;
-    if (targetPitch < -90) targetPitch = -90;
-  }
-}
-
-// ================== LOOP ==================
 void loop() {
-  handleKeyboardInput();
+    imu.update();
 
-  // Update semua perhitungan sensor
-  imuBaro.update();
+    Serial.print("Roll: ");
+    Serial.print(imu.getRollKalman());
+    Serial.print(" deg |")
+    Serial.print("  Pitch: ");
+    Serial.print(imu.getPitchKalman());
+    Serial.print(" deg |")
+    Serial.print("  Altitude: ");
+    Serial.print(imu.getAltitude());
+    Serial.println(" m |")
 
-  float rollKal   = imuBaro.getRollKalman();
-  float pitchKal  = imuBaro.getPitchKalman();
-  float altitude  = imuBaro.getAltitude();
-  // float pressure = imuBaro.getPressure(); // kalau mau dipakai
-
-  // Kirim data via Serial
-  Serial.print("RollKalman:");  Serial.print(rollKal);
-  Serial.print(",PitchKalman:"); Serial.print(pitchKal);
-  Serial.print(",Altitude:");   Serial.print(altitude);
-  Serial.print(" ThredHoldRoll :"); Serial.println(targetRoll);
-
-  // Alert system
-  float rollThreshold = targetRoll;
-  if (abs(rollKal) >= rollThreshold) {
-    Serial.println("⚠ ROLL MELEBIHI BATAS!");
-  }
-
-  delay(20); // ~50 Hz
+    delay(20);
 }
